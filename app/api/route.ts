@@ -6,7 +6,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 const azureHost = "linuxgeneva-microsoft.azurecr.io";
 const tokenPath = "/oauth2/token";
 
-export const revalidate = 43200;
+export const revalidate = 3600; // 1 hour
 
 // Define the image names and their tag regexes.
 // (Note: for names that aren’t valid JS identifiers, we adjust them.)
