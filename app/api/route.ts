@@ -1,10 +1,10 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 // ======================
 // Azure Container Registry Setup
 // ======================
-const azureHost = 'linuxgeneva-microsoft.azurecr.io';
-const tokenPath = '/oauth2/token';
+const azureHost = "linuxgeneva-microsoft.azurecr.io";
+const tokenPath = "/oauth2/token";
 
 export const revalidate = 43200;
 
@@ -31,10 +31,15 @@ async function getAuthToken(image: string): Promise<string> {
 
 // Recursively list all tags for an image.
 // (The API returns 1000 tags at a time; we keep paging until no more tags.)
-async function listImageTags(image: string, last: string = ''): Promise<string[]> {
+async function listImageTags(
+  image: string,
+  last: string = ""
+): Promise<string[]> {
   const url = `https://${azureHost}/v2/${image}/tags/list?n=1000&last=${last}`;
   const token = await getAuthToken(image);
-  const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   if (!response.ok) {
     throw new Error(`Error fetching tags for ${image}`);
   }
@@ -61,7 +66,10 @@ function isVersionGreater(v1: number[], v2: number[]): boolean {
 
 // For one image, go through its tags, match with the regex,
 // and return the tag with the highest “version.”
-async function getLatestAzureImageTag(image: string, pattern: RegExp): Promise<string> {
+async function getLatestAzureImageTag(
+  image: string,
+  pattern: RegExp
+): Promise<string> {
   const tags = await listImageTags(image);
   let latestTag: string | null = null;
   let latestVersion: number[] = [];
@@ -110,32 +118,61 @@ const IMAGE_URLS = [
 
 // Parse a repository URL into a registry and repository name.
 function getRepoInfo(url: string): { registry: string; repository: string } {
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    url = 'https://' + url;
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
   }
   const parsed = new URL(url);
   const registry = parsed.hostname;
   let repository = parsed.pathname;
-  if (repository.startsWith('/v2/')) {
+  if (repository.startsWith("/v2/")) {
     repository = repository.slice(4);
   }
-  if (repository.endsWith('/tags/list')) {
+  if (repository.endsWith("/tags/list")) {
     repository = repository.slice(0, -10);
   }
-  repository = repository.replace(/^\/+|\/+$/g, '');
+  repository = repository.replace(/^\/+|\/+$/g, "");
   return { registry, repository };
 }
 
 // Fetch the list of tags from the registry.
-async function getTags(registry: string, repository: string): Promise<string[]> {
+async function getTags(
+  registry: string,
+  repository: string
+): Promise<string[]> {
   const tagsUrl = `https://${registry}/v2/${repository}/tags/list`;
   try {
     const response = await fetch(tagsUrl);
-    if (!response.ok) throw new Error('Failed to fetch tags');
+    if (!response.ok) throw new Error("Failed to fetch tags");
     const data = await response.json();
     const tags: string[] = data.tags || [];
-    // Return the last 5 tags (this API may not return them in date order)
-    return tags.slice(-5);
+    const versionRegex = /\b(?:v)?(\d+(?:\.\d+)+)(?=-|\b)/g;
+
+    function getVersion(tag: string): string | null {
+      const match = tag.match(versionRegex);
+      return match ? match[0] : null;
+    }
+
+    function compareVersions(a: string, b: string): number {
+      const aParts = a.split(".").map(Number);
+      const bParts = b.split(".").map(Number);
+
+      for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+        const aVal = aParts[i] || 0;
+        const bVal = bParts[i] || 0;
+        if (aVal > bVal) return 1;
+        if (aVal < bVal) return -1;
+      }
+      return 0;
+    }
+
+    const sortedTags = tags
+      .map((tag) => ({ tag, version: getVersion(tag) }))
+      .filter((item) => item.version !== null)
+      .sort((a, b) => compareVersions(a.version!, b.version!))
+      .map((item) => item.tag);
+
+    // Return the last 5 tags
+    return sortedTags.slice(-5);
   } catch (e) {
     console.error(`Error fetching tags for ${repository} on ${registry}:`, e);
     return [];
@@ -143,26 +180,36 @@ async function getTags(registry: string, repository: string): Promise<string[]> 
 }
 
 // For a given tag, fetch its manifest and config blob to get the creation date.
-async function getTagCreatedDate(registry: string, repository: string, tag: string): Promise<Date | null> {
+async function getTagCreatedDate(
+  registry: string,
+  repository: string,
+  tag: string
+): Promise<Date | null> {
   const manifestUrl = `https://${registry}/v2/${repository}/manifests/${tag}`;
   try {
     const manifestRes = await fetch(manifestUrl, {
-      headers: { 'Accept': 'application/vnd.docker.distribution.manifest.v2+json' },
+      headers: {
+        Accept: "application/vnd.docker.distribution.manifest.v2+json",
+      },
     });
-    if (!manifestRes.ok) throw new Error('Failed to fetch manifest');
+    if (!manifestRes.ok) throw new Error("Failed to fetch manifest");
     const manifest = await manifestRes.json();
     const digest = manifest.config?.digest;
     if (!digest) {
-      console.error(`Manifest for ${repository}:${tag} does not contain a config digest.`);
+      console.error(
+        `Manifest for ${repository}:${tag} does not contain a config digest.`
+      );
       return null;
     }
     const configUrl = `https://${registry}/v2/${repository}/blobs/${digest}`;
     const configRes = await fetch(configUrl);
-    if (!configRes.ok) throw new Error('Failed to fetch config blob');
+    if (!configRes.ok) throw new Error("Failed to fetch config blob");
     const config = await configRes.json();
     let createdStr = config.created;
     if (!createdStr) {
-      console.error(`Config for ${repository}:${tag} does not have a 'created' field.`);
+      console.error(
+        `Config for ${repository}:${tag} does not have a 'created' field.`
+      );
       return null;
     }
     // Adjust for ISO formatting if needed.
@@ -190,10 +237,13 @@ async function processMcrImage(url: string) {
     })
   );
   // Filter out tags that couldn’t provide a creation date.
-  const validDates = tagDates.filter(item => item.created !== null) as { tag: string; created: Date }[];
+  const validDates = tagDates.filter((item) => item.created !== null) as {
+    tag: string;
+    created: Date;
+  }[];
   // Sort by date (newest first)
   validDates.sort((a, b) => b.created.getTime() - a.created.getTime());
-  const latestReleases = validDates.slice(0, 5).map(item => ({
+  const latestReleases = validDates.slice(0, 5).map((item) => ({
     tag: item.tag,
     created: item.created.toISOString(),
   }));
@@ -201,7 +251,9 @@ async function processMcrImage(url: string) {
 }
 
 async function processMcrImages() {
-  const results = await Promise.all(IMAGE_URLS.map((url) => processMcrImage(url)));
+  const results = await Promise.all(
+    IMAGE_URLS.map((url) => processMcrImage(url))
+  );
   return results;
 }
 
