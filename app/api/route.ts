@@ -9,267 +9,225 @@ const tokenPath = "/oauth2/token";
 export const revalidate = 3600; // 1 hour
 
 // Define the image names and their tag regexes.
-// (Note: for names that aren’t valid JS identifiers, we adjust them.)
+// (Note: for names that aren't valid JS identifiers, we adjust them.)
 const azureImagePatterns: { [image: string]: RegExp } = {
-  genevamdsd: /^mariner_(\d{8})\.(\d{1,2})$/i, // e.g. mariner_20230101.1
-  genevamdm: /^(\d{1,2})\.(\d{4})\.(\d{1,4})\.(\d{1,4})-.*$/i, // e.g. 2.2023.210.1249-c1f0d4-20230210t1402
-  "genevafluentd_td-agent": /^mariner_(\d{8})\.(\d{1,2})$/i,
-  genevafluentd: /^mariner_(\d{8})\.(\d{1,2})$/i,
-  genevasecpackinstall: /^master_(\d{8})\.(\d{1,2})$/i,
+	genevamdsd: /^(\d+\.\d+\.\d+)-(\d{8})-(\d+)$/, // 1.35.1-20250429-1
+	genevamdm: /^(\d+\.\d{12}\.\d+)-(\d{8})-(\d+)$/, // 2.202505011038.0-20250502-1
+	genevafluentd: /^(\d+\.\d+\.\d+)-(\d{8})-(\d+)$/, // 1.18.0-20250606-1
+	genevasecpackinstall: /^master_(\d{8})\.(\d{1,2})$/i,
+	// genevafluentd_td-agent: /^mariner_(\d{8})\.(\d{1,2})$/i,
 };
 
-// Get an authentication token for a given image.
+// ======================
+// Helper utilities (Azure ACR)
+// ======================
+
+// Acquire a read‑only metadata token for one repository
 async function getAuthToken(image: string): Promise<string> {
-  const url = `https://${azureHost}${tokenPath}?service=${azureHost}&scope=repository:${image}:metadata_read`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to get auth token for ${image}`);
-  }
-  const data = await response.json();
-  return data.access_token;
+	const url = `https://${azureHost}${tokenPath}?service=${azureHost}&scope=repository:${image}:metadata_read`;
+	const response = await fetch(url);
+	if (!response.ok) throw new Error(`Failed to get auth token for ${image}`);
+	const { access_token } = await response.json();
+	return access_token;
 }
 
-// Recursively list all tags for an image.
-// (The API returns 1000 tags at a time; we keep paging until no more tags.)
-async function listImageTags(
-  image: string,
-  last: string = ""
-): Promise<string[]> {
-  const url = `https://${azureHost}/v2/${image}/tags/list?n=1000&last=${last}`;
-  const token = await getAuthToken(image);
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!response.ok) {
-    throw new Error(`Error fetching tags for ${image}`);
-  }
-  const data = await response.json();
-  const tags: string[] = data.tags || [];
-  if (tags.length > 0) {
-    // Recursively fetch next batch using the last tag as marker.
-    const moreTags = await listImageTags(image, tags[tags.length - 1]);
-    return tags.concat(moreTags);
-  }
-  return tags;
+// Recursively list *all* tags (ACR returns 1000 / page)
+async function listImageTags(image: string, last = ""): Promise<string[]> {
+	const url = `https://${azureHost}/v2/${image}/tags/list?n=1000&last=${last}`;
+	const token = await getAuthToken(image);
+	const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+	if (!res.ok) throw new Error(`Error fetching tags for ${image}`);
+	const data = await res.json();
+	const tags: string[] = data.tags ?? [];
+	if (tags.length === 0) return [];
+	const more = await listImageTags(image, tags[tags.length - 1]);
+	return tags.concat(more);
 }
 
-// Compare two version arrays (each is an array of numbers).
-function isVersionGreater(v1: number[], v2: number[]): boolean {
-  for (let i = 0; i < Math.max(v1.length, v2.length); i++) {
-    const num1 = v1[i] || 0;
-    const num2 = v2[i] || 0;
-    if (num1 > num2) return true;
-    if (num1 < num2) return false;
-  }
-  return false;
+// Compare semantic-ish version arrays
+function isVersionGreater(a: number[], b: number[]): boolean {
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const av = a[i] ?? 0;
+		const bv = b[i] ?? 0;
+		if (av !== bv) return av > bv;
+	}
+	return false;
 }
 
-// For one image, go through its tags, match with the regex,
-// and return the tag with the highest “version.”
-async function getLatestAzureImageTag(
-  image: string,
-  pattern: RegExp
-): Promise<string> {
-  const tags = await listImageTags(image);
-  let latestTag: string | null = null;
-  let latestVersion: number[] = [];
-  for (const tag of tags) {
-    const match = tag.match(pattern);
-    if (match) {
-      // Convert captured groups into numbers.
-      const versionParts = match.slice(1).map((num) => parseInt(num, 10));
-      if (!latestTag || isVersionGreater(versionParts, latestVersion)) {
-        latestTag = tag;
-        latestVersion = versionParts;
-      }
-    }
-  }
-  if (!latestTag) {
-    throw new Error(`Unable to find matched tag for ${image}`);
-  }
-  return latestTag;
+// Determine latest tag (highest numeric capture groups)
+async function getLatestAzureImageTag(image: string, pattern: RegExp): Promise<string> {
+	const tags = await listImageTags(image);
+	let latest: { tag: string; parts: number[] } | null = null;
+	for (const tag of tags) {
+		const m = tag.match(pattern);
+		if (!m) continue;
+		const parts = m.slice(1).map(n => Number.parseInt(n, 10));
+		if (!latest || isVersionGreater(parts, latest.parts)) {
+			latest = { tag, parts };
+		}
+	}
+	if (!latest) throw new Error(`No tag matched pattern for ${image}`);
+	return latest.tag;
 }
 
-// Process all Azure images and return an object mapping image names to their latest tag.
+// Query every Azure image
 async function processAzureImages() {
-  const results: { [image: string]: string } = {};
-  for (const [image, pattern] of Object.entries(azureImagePatterns)) {
-    try {
-      const latestTag = await getLatestAzureImageTag(image, pattern);
-      results[image] = latestTag;
-    } catch (error: any) {
-      results[image] = `Error: ${error.message}`;
-    }
-  }
-  return results;
+	const result: Record<string, string> = {};
+	for (const [img, re] of Object.entries(azureImagePatterns)) {
+		try {
+			result[img] = await getLatestAzureImageTag(img, re);
+		} catch (err: any) {
+			result[img] = `Error: ${err.message}`;
+		}
+	}
+	return result;
 }
 
 // ======================
-// MCR Images Setup
+// MCR Setup
 // ======================
 
-const IMAGE_URLS = [
-  "mcr.microsoft.com/azure-watson/agent/agent_mariner",
-  "mcr.microsoft.com/oss/kubernetes-csi/livenessprobe",
-  "mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar",
-  "mcr.microsoft.com/oss/azure/secrets-store/provider-azure",
-  "mcr.microsoft.com/oss/kubernetes-csi/secrets-store/driver",
-];
+const mcrImagePatterns: { [url: string]: RegExp } = {
+	"mcr.microsoft.com/azure-watson/agent/agent_mariner": /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/, // 1.22.14.0
+	"mcr.microsoft.com/oss/v2/kubernetes-csi/livenessprobe": /^v(\d+)\.(\d+)\.(\d+)$/,
+	"mcr.microsoft.com/oss/v2/kubernetes-csi/csi-node-driver-registrar": /^v(\d+)\.(\d+)\.(\d+)$/,
+	"mcr.microsoft.com/oss/v2/azure/secrets-store/provider-azure": /^v(\d+)\.(\d+)\.(\d+)$/,
+	"mcr.microsoft.com/oss/v2/kubernetes-csi/secrets-store/driver": /^v(\d+)\.(\d+)\.(\d+)$/,
+};
 
-// Parse a repository URL into a registry and repository name.
+// repo path (no registry) for which a *single‑arch* manifest is expected
+const singleArchRepos = new Set<string>(["azure-watson/agent/agent_mariner"]);
+
 function getRepoInfo(url: string): { registry: string; repository: string } {
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    url = "https://" + url;
-  }
-  const parsed = new URL(url);
-  const registry = parsed.hostname;
-  let repository = parsed.pathname;
-  if (repository.startsWith("/v2/")) {
-    repository = repository.slice(4);
-  }
-  if (repository.endsWith("/tags/list")) {
-    repository = repository.slice(0, -10);
-  }
-  repository = repository.replace(/^\/+|\/+$/g, "");
-  return { registry, repository };
+	if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+	const u = new URL(url);
+	let repo = u.pathname;
+	if (repo.startsWith("/v2/")) repo = repo.slice(4);
+	if (repo.endsWith("/tags/list")) repo = repo.slice(0, -10);
+	repo = repo.replace(/^\/+|\/+$/g, "");
+	return { registry: u.hostname, repository: repo };
 }
 
-// Fetch the list of tags from the registry.
-async function getTags(
-  registry: string,
-  repository: string
-): Promise<string[]> {
-  const tagsUrl = `https://${registry}/v2/${repository}/tags/list`;
-  try {
-    const response = await fetch(tagsUrl);
-    if (!response.ok) throw new Error("Failed to fetch tags");
-    const data = await response.json();
-    const tags: string[] = data.tags || [];
-    const versionRegex = /\b(?:v)?(\d+(?:\.\d+)+)(?=-|\b)/g;
-
-    function getVersion(tag: string): string | null {
-      const match = tag.match(versionRegex);
-      return match ? match[0] : null;
-    }
-
-    function compareVersions(a: string, b: string): number {
-      const aParts = a.split(".").map(Number);
-      const bParts = b.split(".").map(Number);
-
-      for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
-        const aVal = aParts[i] || 0;
-        const bVal = bParts[i] || 0;
-        if (aVal > bVal) return 1;
-        if (aVal < bVal) return -1;
-      }
-      return 0;
-    }
-
-    const sortedTags = tags
-      .map((tag) => ({ tag, version: getVersion(tag) }))
-      .filter((item) => item.version !== null)
-      .sort((a, b) => compareVersions(a.version!, b.version!))
-      .map((item) => item.tag);
-
-    // Return the last 5 tags
-    return sortedTags.slice(-5);
-  } catch (e) {
-    console.error(`Error fetching tags for ${repository} on ${registry}:`, e);
-    return [];
-  }
+async function getTags(reg: string, repo: string): Promise<string[]> {
+	const url = `https://${reg}/v2/${repo}/tags/list`;
+	try {
+		const res = await fetch(url);
+		if (!res.ok) throw new Error("tag list fetch failed");
+		const data = await res.json();
+		return data.tags ?? [];
+	} catch (e) {
+		console.error(`Failed to list tags for ${repo} on ${reg}:`, e);
+		return [];
+	}
 }
 
-// For a given tag, fetch its manifest and config blob to get the creation date.
-async function getTagCreatedDate(
-  registry: string,
-  repository: string,
-  tag: string
+// -------- helpers to read manifests / config timestamps --------
+
+async function legacyGetTagCreatedDate(base: string, repo: string, tag: string): Promise<Date | null> {
+	const manRes = await fetch(`${base}/manifests/${tag}`, {
+		headers: { Accept: "application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json" },
+	});
+	if (!manRes.ok) return null;
+	const man = await manRes.json();
+	const digest = man?.config?.digest;
+	if (!digest) return null;
+	const cfg = await fetch(`${base}/blobs/${digest}`).then(r => (r.ok ? r.json() : null));
+	return cfg?.created ? new Date(cfg.created) : null;
+}
+
+async function multiArchGetTagCreatedDate(
+	base: string,
+	repo: string,
+	tag: string,
+	platform = { os: "linux", architecture: "amd64" }
 ): Promise<Date | null> {
-  const manifestUrl = `https://${registry}/v2/${repository}/manifests/${tag}`;
-  try {
-    const manifestRes = await fetch(manifestUrl, {
-      headers: {
-        Accept: "application/vnd.docker.distribution.manifest.v2+json",
-      },
-    });
-    if (!manifestRes.ok) throw new Error("Failed to fetch manifest");
-    const manifest = await manifestRes.json();
-    const digest = manifest.config?.digest;
-    if (!digest) {
-      console.error(
-        `Manifest for ${repository}:${tag} does not contain a config digest.`
-      );
-      return null;
-    }
-    const configUrl = `https://${registry}/v2/${repository}/blobs/${digest}`;
-    const configRes = await fetch(configUrl);
-    if (!configRes.ok) throw new Error("Failed to fetch config blob");
-    const config = await configRes.json();
-    let createdStr = config.created;
-    if (!createdStr) {
-      console.error(
-        `Config for ${repository}:${tag} does not have a 'created' field.`
-      );
-      return null;
-    }
-    // Adjust for ISO formatting if needed.
-    if (createdStr.endsWith("Z")) {
-      createdStr = createdStr.replace("Z", "+00:00");
-    }
-    return new Date(createdStr);
-  } catch (e) {
-    console.error(`Error fetching creation date for ${repository}:${tag}:`, e);
-    return null;
-  }
+	const index = await fetch(`${base}/manifests/${tag}`, {
+		headers: {
+			Accept: "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json",
+		},
+	}).then(r => (r.ok ? r.json() : null));
+	if (!index) return null;
+
+	// single‑arch shortcut
+	if (index.config?.digest) return legacyGetTagCreatedDate(base, repo, tag);
+
+	const entry = (index.manifests ?? []).find(
+		(m: any) => m.platform?.os === platform.os && m.platform?.architecture === platform.architecture
+	);
+	if (!entry) return null;
+
+	const man = await fetch(`${base}/manifests/${entry.digest}`, {
+		headers: {
+			Accept: "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+		},
+	}).then(r => (r.ok ? r.json() : null));
+	const digest = man?.config?.digest;
+	if (!digest) return null;
+	const cfg = await fetch(`${base}/blobs/${digest}`).then(r => (r.ok ? r.json() : null));
+	return cfg?.created ? new Date(cfg.created) : null;
 }
 
-// Process one MCR image by retrieving its tags and then getting each tag's creation date.
-async function processMcrImage(url: string) {
-  const { registry, repository } = getRepoInfo(url);
-  const tags = await getTags(registry, repository);
-  if (tags.length === 0) {
-    return { image: url, releases: [] };
-  }
-  const tagDates = await Promise.all(
-    tags.map(async (tag) => {
-      const created = await getTagCreatedDate(registry, repository, tag);
-      return { tag, created };
-    })
-  );
-  // Filter out tags that couldn’t provide a creation date.
-  const validDates = tagDates.filter((item) => item.created !== null) as {
-    tag: string;
-    created: Date;
-  }[];
-  // Sort by date (newest first)
-  validDates.sort((a, b) => b.created.getTime() - a.created.getTime());
-  const latestReleases = validDates.slice(0, 5).map((item) => ({
-    tag: item.tag,
-    created: item.created.toISOString(),
-  }));
-  return { image: url, releases: latestReleases };
+// Smart wrapper
+async function getTagCreatedDate(
+	registry: string,
+	repository: string,
+	tag: string,
+	platform: { os: string; architecture: string } = { os: "linux", architecture: "amd64" }
+): Promise<Date | null> {
+	const base = `https://${registry}/v2/${repository}`;
+	return singleArchRepos.has(repository)
+		? legacyGetTagCreatedDate(base, repository, tag)
+		: multiArchGetTagCreatedDate(base, repository, tag, platform);
 }
 
+// ----------------- process a single MCR repo -----------------
+async function processMcrImage(url: string, pattern: RegExp) {
+	const { registry, repository } = getRepoInfo(url);
+	const tags = await getTags(registry, repository);
+	if (tags.length === 0) return { image: url, releases: [] };
+
+	const typed: { tag: string; parts: number[] }[] = tags
+		.map(tag => {
+			const m = tag.match(pattern);
+			if (!m) return null;
+			return { tag, parts: m.slice(1).map(n => Number.parseInt(n, 10)) };
+		})
+		.filter(Boolean) as { tag: string; parts: number[] }[];
+
+	if (typed.length === 0) return { image: url, releases: [] };
+
+	// newest by version
+	typed.sort((a, b) => (isVersionGreater(b.parts, a.parts) ? 1 : -1));
+	const latest = typed.slice(0, 5).map(t => t.tag);
+
+	const dated = await Promise.all(
+		latest.map(async tag => ({ tag, created: await getTagCreatedDate(registry, repository, tag) }))
+	);
+
+	return {
+		image: url,
+		releases: dated
+			.filter(r => r.created)
+			.sort((a, b) => (b.created!.getTime() - a.created!.getTime()))
+			.map(r => ({ tag: r.tag, created: r.created!.toISOString() })),
+	};
+}
+
+// Process all MCR images concurrently
 async function processMcrImages() {
-  const results = await Promise.all(
-    IMAGE_URLS.map((url) => processMcrImage(url))
-  );
-  return results;
+	return Promise.all(Object.entries(mcrImagePatterns).map(([url, re]) => processMcrImage(url, re)));
 }
 
 // ======================
-// Main Handler
+// Main handler (Vercel Edge / Next.js RSC compatible)
 // ======================
 
 export async function GET(request: Request) {
-  try {
-    // Run both the Azure and MCR image queries concurrently.
-    const [azureResults, mcrResults] = await Promise.all([
-      processAzureImages(),
-      processMcrImages(),
-    ]);
-    return Response.json({ azureImages: azureResults, mcrImages: mcrResults });
-  } catch (error: any) {
-    return Response.json([]);
-  }
+	try {
+		const [azureImages, mcrImages] = await Promise.all([processAzureImages(), processMcrImages()]);
+		return Response.json({ azureImages, mcrImages });
+	} catch (err) {
+		console.error(err);
+		return Response.json([]);
+	}
 }
